@@ -11,7 +11,7 @@ import json
 # CONFIG
 # ---------------------------
 st.set_page_config(
-    page_title="P2P CoE Diagnostic - SSC (v3)",
+    page_title="P2P CoE Diagnostic - SSC (v4)",
     layout="wide"
 )
 
@@ -118,10 +118,12 @@ def call_openai_chat(prompt: str) -> str:
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=90)
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        return "ERROR: Timeout contacting OpenAI API. Please try again (network was too slow)."
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -130,10 +132,13 @@ def ai_pre_score_responses(client_responses: dict) -> dict:
     """
     Given client_responses = {dimension: [{"question":..., "answer":...}, ...]},
     return ai_scores = {dimension: [{"question":..., "answer":..., "ai_score":int, "reason":str}, ...]}
+    We call OpenAI separately per dimension to reduce payload and avoid timeouts.
     """
-    prompt = """
+    overall_result = {}
+
+    base_instructions = """
 You will receive a structured object containing responses to a P2P (Procure-to-Pay) diagnostic questionnaire
-across three dimensions: People, Process, and Technology.
+for ONE dimension: either People, Process, or Technology.
 
 For each answer, you must:
 1) Assign a maturity score from 1 to 5 (1 = very poor / ad-hoc, 5 = world-class / fully optimized).
@@ -146,99 +151,44 @@ Important:
 - If well-documented, measured, mostly stable → Score 4–5 depending on how strong it sounds.
 - If the answer is empty or non-informative, default to score 3 and reason "Insufficient detail; assumed mid-level maturity."
 
-You MUST respond **only** in valid JSON with this exact structure:
+You MUST respond ONLY in valid JSON with this exact structure:
 
-{
-  "People": [
-    {
-      "index": <question_index_starting_from_1>,
-      "question": "<question text>",
-      "answer": "<client answer>",
-      "ai_score": <integer 1-5>,
-      "reason": "<short reason>"
-    },
-    ...
-  ],
-  "Process": [
-    ...
-  ],
-  "Technology": [
-    ...
-  ]
-}
+[
+  {
+    "index": <question_index_starting_from_1>,
+    "question": "<question text>",
+    "answer": "<client answer>",
+    "ai_score": <integer 1-5>,
+    "reason": "<short reason>"
+  }
+]
 
-Do not include any other text outside the JSON object.
+Do not include any other text outside the JSON array.
 """
 
-    # Append actual data
-    prompt += "\n\nHere is the client response data (as JSON):\n"
-    prompt += json.dumps(client_responses, indent=2)
+    for dim in ["People", "Process", "Technology"]:
+        items = client_responses.get(dim, [])
+        if not items:
+            overall_result[dim] = []
+            continue
 
-    raw = call_openai_chat(prompt)
-    if raw.startswith("ERROR:"):
-        return {"error": raw}
+        prompt = base_instructions + "\n\nDimension: " + dim + "\n\nHere is the client response data (as JSON):\n"
+        prompt += json.dumps(items, indent=2)
 
-    # Try to parse JSON from the raw response
-    try:
-        # In case model adds markdown fences, strip them
-        cleaned = raw.strip().strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
-        parsed = json.loads(cleaned)
-        return parsed
-    except Exception as e:
-        return {"error": f"Failed to parse AI JSON: {e}\nRaw response was:\n{raw}"}
+        raw = call_openai_chat(prompt)
+        if raw.startswith("ERROR:"):
+            return {"error": f"{dim} scoring failed: {raw}"}
 
+        try:
+            cleaned = raw.strip().strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            parsed = json.loads(cleaned)
+            overall_result[dim] = parsed
+        except Exception as e:
+            return {"error": f"{dim} scoring failed: could not parse AI JSON: {e}\nRaw response was:\n{raw}"}
 
-def generate_ai_summary(scores: dict, final_scores: dict) -> str:
-    """
-    Generate an executive summary based on dimension scores and selected final scores.
-    scores: raw average dimension scores
-    final_scores: {dimension: avg_final_score}
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return (
-            "AI summary not generated – missing OPENAI_API_KEY.\n"
-            "Set your OpenAI key as an environment variable and rerun the app."
-        )
-
-    people_ai = scores.get("People", 0)
-    process_ai = scores.get("Process", 0)
-    tech_ai = scores.get("Technology", 0)
-
-    people_final = final_scores.get("People", people_ai)
-    process_final = final_scores.get("Process", process_ai)
-    tech_final = final_scores.get("Technology", tech_ai)
-
-    prompt = f"""
-You are a senior consulting partner evaluating a client's P2P function for a P2P Center of Excellence (CoE) setup.
-
-You have AI-pre-scored maturity levels and consultant-validated scores as follows
-(1 = very poor, 5 = world-class):
-
-AI Scores:
-- People: {people_ai:.2f}
-- Process: {process_ai:.2f}
-- Technology: {tech_ai:.2f}
-
-Consultant Final Scores:
-- People: {people_final:.2f}
-- Process: {process_final:.2f}
-- Technology: {tech_final:.2f}
-
-Using this information, please generate:
-1) A concise executive summary (3–5 bullet points) about the maturity profile.
-2) Top 5 pain points (numbered list) across People, Process, Technology.
-3) Top 5 quick-win recommendations (0–3 months) for a P2P CoE.
-4) 3–5 medium-term initiatives (6–18 months) to build a scalable P2P CoE.
-
-Keep it CxO-friendly and focused on actionable insights.
-Do not repeat the scores verbatim; interpret them.
-"""
-
-    raw = call_openai_chat(prompt)
-    return raw
+    return overall_result
 
 # ---------------------------
 # SESSION STATE HELPERS
@@ -259,6 +209,47 @@ def init_session_state():
             "Process": {},
             "Technology": {},
         }
+    if "qa_document_text" not in st.session_state:
+        st.session_state["qa_document_text"] = None
+
+# ---------------------------
+# Q&A DOCUMENT HELPER
+# ---------------------------
+
+def build_qa_document_text(client_name: str, assessor_name: str, responses: dict) -> str:
+    """Create a plain-text (Word-friendly) document with all questions and answers."""
+    lines = []
+    lines.append("P2P CoE Diagnostic – Q&A Record")
+    lines.append("=" * 60)
+    lines.append("")
+    if client_name:
+        lines.append(f"Client / Entity : {client_name}")
+    if assessor_name:
+        lines.append(f"Assessor       : {assessor_name}")
+    lines.append("")
+    lines.append("Note: This document captures raw self-assessment inputs for reference and audit trail.")
+    lines.append("")
+
+    for dim in ["People", "Process", "Technology"]:
+        dim_items = responses.get(dim, [])
+        if not dim_items:
+            continue
+        lines.append("")
+        lines.append(f"{dim} Dimension")
+        lines.append("-" * (len(dim) + 11))
+        lines.append("")
+        for item in dim_items:
+            idx = item.get("index")
+            q = (item.get("question", "") or "").strip()
+            a = (item.get("answer", "") or "").strip()
+            lines.append(f"Q{idx}. {q}")
+            if a:
+                lines.append(f"   A: {a}")
+            else:
+                lines.append("   A: [No response provided]")
+            lines.append("")
+
+    return "\n".join(lines)
 
 # ---------------------------
 # UI SECTIONS
@@ -290,6 +281,7 @@ def render_client_assessment():
             responses[dim].append({"index": i, "question": q, "answer": answer})
         st.markdown("---")
 
+    # Run AI pre-scoring
     if st.button("Run AI Pre-Scoring (Based on Answers)"):
         st.session_state["client_responses"] = responses
         with st.spinner("Calling AI to pre-score responses..."):
@@ -299,6 +291,24 @@ def render_client_assessment():
             st.error(ai_result["error"])
         else:
             st.success("AI pre-scoring completed. Go to 'Consultant Review & Dashboard' tab to view and override scores.")
+
+    # Q&A document creation and download
+    st.markdown("### Download Q&A Record")
+    if st.button("Prepare Q&A Document for Download"):
+        st.session_state["client_responses"] = responses
+        qa_text = build_qa_document_text(client_name, assessor_name, responses)
+        st.session_state["qa_document_text"] = qa_text
+        st.success("Q&A document prepared. Use the download button below.")
+
+    qa_text = st.session_state.get("qa_document_text", None)
+    if qa_text:
+        file_name = (client_name or "Client") + "_P2P_CoE_QA.txt"
+        st.download_button(
+            label="Download Q&A as Text File",
+            data=qa_text.encode("utf-8"),
+            file_name=file_name.replace(" ", "_"),
+            mime="text/plain",
+        )
 
     return client_name, assessor_name
 
@@ -326,6 +336,7 @@ def render_consultant_review_and_dashboard():
 
     dim_scores_ai = {}
     dim_scores_final = {}
+    export_rows = []  # to collect full question-level data for CSV export
 
     # For each dimension, show table with AI scores & override options
     for dim in ["People", "Process", "Technology"]:
@@ -360,14 +371,17 @@ def render_consultant_review_and_dashboard():
             st.write(f"**Consultant Final Score:** {final_score}")
             st.markdown("---")
 
-            rows.append({
+            row = {
+                "dimension": dim,
                 "index": idx,
                 "question": question,
                 "answer": answer,
                 "ai_score": ai_score,
                 "final_score": final_score,
                 "reason": reason,
-            })
+            }
+            rows.append(row)
+            export_rows.append(row)
 
         df_dim = pd.DataFrame(rows)
         if not df_dim.empty:
@@ -427,26 +441,19 @@ def render_consultant_review_and_dashboard():
     )
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # AI Summary
-    st.markdown("### AI-Generated Executive Summary (Based on Final Scores)")
-    if st.button("Generate Executive Summary with AI"):
-        with st.spinner("Calling AI to generate narrative..."):
-            summary_text = generate_ai_summary(dim_scores_ai, dim_scores_final)
-        st.write(summary_text)
-
-    # Download option
+    # Download option (full question & answer level data)
     st.markdown("### Export Data")
-    export_payload = {
-        "ai_scoring": ai_scoring,
-        "final_scores": dim_scores_final,
-    }
-    csv_data = pd.json_normalize(export_payload, sep="_").to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download Summary Data as CSV",
-        data=csv_data,
-        file_name="p2p_coe_diagnostic_summary.csv",
-        mime="text/csv"
-    )
+    if export_rows:
+        df_export = pd.DataFrame(export_rows)
+        csv_data = df_export.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Question-Level Data as CSV",
+            data=csv_data,
+            file_name="p2p_coe_diagnostic_question_level.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No question-level data available to export.")
 
 # ---------------------------
 # BRANDING HELPERS
@@ -484,7 +491,7 @@ def render_sidebar_branding():
     st.sidebar.markdown("### StrategyStack Consulting")
     if os.path.exists("ssc_logo.png"):
         st.sidebar.image("ssc_logo.png", width=160)
-    st.sidebar.markdown("P2P CoE Diagnostic (v3)")
+    st.sidebar.markdown("P2P CoE Diagnostic (v4)")
     st.sidebar.markdown("---")
 
 # ---------------------------
